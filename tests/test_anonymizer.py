@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import os
+import warnings
 import zipfile
 
 import pydicom
@@ -179,6 +180,223 @@ def test_output_zip_flat_and_readable(processed):
         assert all("/" not in n and n.endswith(".dcm") for n in names)
         with zf.open(names[0]) as fh:
             pydicom.dcmread(io.BytesIO(fh.read()))  # 输出可被标准解析器读取
+
+
+def test_multivalue_da_and_dt_are_shifted_per_item(tmp_path):
+    from pydicom.dataelem import DataElement
+    from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+    from pydicom.multival import MultiValue
+    from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian
+    from pydicom.tag import Tag
+
+    def run_with_dates(study_dates, acquisition_dates):
+        fm = FileMetaDataset()
+        fm.MediaStorageSOPClassUID = CTImageStorage
+        fm.MediaStorageSOPInstanceUID = "9.8.1"
+        fm.TransferSyntaxUID = ExplicitVRLittleEndian
+        ds = FileDataset(None, {}, file_meta=fm, preamble=b"\0" * 128)
+        ds.SOPClassUID = CTImageStorage
+        ds.SOPInstanceUID = "9.8.1"
+        ds.StudyInstanceUID = "9.8.2"
+        ds.SeriesInstanceUID = "9.8.3"
+        ds.PatientID = "P-DATES"
+        ds.PatientName = "Date^Tester"
+        ds.PatientBirthDate = MultiValue(
+            str, ["19800115", "19901231"]
+        )
+        ds[Tag(0x00080020)] = DataElement(Tag(0x00080020), "DA", study_dates)
+        ds.AcquisitionDateTime = acquisition_dates
+
+        seq_item = Dataset()
+        seq_item.ContentDate = MultiValue(
+            str, ["20240101", "20240229", "20241231"]
+        )
+        seq_item.AcquisitionDateTime = (
+            "20240101123045.123456+0200\\20240229235959-0500"
+        )
+        ds.ReferencedStudySequence = [seq_item]
+
+        zp = tmp_path / "multi-dates.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.writestr("multi.dcm", _write_dataset(ds))
+
+        ex = tmp_path / "multi-dates-ex"
+        ex.mkdir(exist_ok=True)
+        members = safe_extract_zip(
+            str(zp), str(ex),
+            settings.max_extracted_bytes, settings.max_extracted_files,
+        )
+        result = Anonymizer(
+            secret=SECRET, shift_dates=True,
+            date_shift_min=-5, date_shift_max=-5,
+        ).run(str(ex), members, str(tmp_path / "multi-dates-out"))
+        report = result.files[0]
+        out = pydicom.dcmread(
+            os.path.join(result.output_dir, report.output_name)
+        )
+        return result, report, out
+
+    def _write_dataset(ds):
+        buf = io.BytesIO()
+        ds.save_as(buf, enforce_file_format=True)
+        return buf.getvalue()
+
+    result, report, out = run_with_dates(
+        MultiValue(str, ["20240101", "20240229", "20241231"]),
+        MultiValue(
+            str,
+            ["20240101123045.123456+0200", "20240229235959-0500"],
+        ),
+    )
+    assert report.status == "ok"
+    assert list(out.PatientBirthDate) == ["19800110", "19901226"]
+    assert len(out.StudyDate) == 3
+    assert list(out.StudyDate) == ["20231227", "20240224", "20241226"]
+    assert len(out.AcquisitionDateTime) == 2
+    assert list(out.AcquisitionDateTime) == [
+        "20231227123045.123456+0200",
+        "20240224235959-0500",
+    ]
+    nested = out.ReferencedStudySequence[0]
+    assert list(nested.ContentDate) == ["20231227", "20240224", "20241226"]
+    assert list(nested.AcquisitionDateTime) == [
+        "20231227123045.123456+0200",
+        "20240224235959-0500",
+    ]
+
+    nested_date_change = next(
+        c for c in report.changes
+        if c.path == "ReferencedStudySequence[0]"
+        and c.keyword == "ContentDate"
+    )
+    assert nested_date_change.new == "20231227\\20240224\\20241226"
+    nested_dt_change = next(
+        c for c in report.changes
+        if c.path == "ReferencedStudySequence[0]"
+        and c.keyword == "AcquisitionDateTime"
+    )
+    assert nested_dt_change.new == (
+        "20231227123045.123456+0200\\20240224235959-0500"
+    )
+
+    by_keyword = {c.keyword: c for c in report.changes}
+    assert by_keyword["StudyDate"].old == "20240101\\20240229\\20241231"
+    assert by_keyword["StudyDate"].new == "20231227\\20240224\\20241226"
+    assert (
+        by_keyword["PatientBirthDate"].new
+        == "19800110\\19901226"
+    )
+    assert (
+        by_keyword["AcquisitionDateTime"].new
+        == "20231227123045.123456+0200\\20240224235959-0500"
+    )
+    assert "\\".join(out.StudyDate) == by_keyword["StudyDate"].new
+    assert "\\".join(out.AcquisitionDateTime) == by_keyword[
+        "AcquisitionDateTime"
+    ].new
+
+
+def test_backslash_separated_dates_are_shifted_without_losing_items(tmp_path):
+    from pydicom.dataelem import RawDataElement
+    from pydicom.dataset import FileDataset, FileMetaDataset
+    from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian
+    from pydicom.tag import Tag
+
+    fm = FileMetaDataset()
+    fm.MediaStorageSOPClassUID = CTImageStorage
+    fm.MediaStorageSOPInstanceUID = "9.8.4"
+    fm.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = FileDataset(None, {}, file_meta=fm, preamble=b"\0" * 128)
+    ds.SOPClassUID = CTImageStorage
+    ds.SOPInstanceUID = "9.8.4"
+    ds.StudyInstanceUID = "9.8.5"
+    ds.SeriesInstanceUID = "9.8.6"
+    ds.PatientID = "P-BACKSLASH"
+    ds.PatientName = "Slash^Date"
+    raw_dates = b"20240101\\20240229\\20241231"
+    ds[Tag(0x00080020)] = RawDataElement(
+        Tag(0x00080020), "DA", 26, raw_dates, 0, True, None
+    )
+    zp = tmp_path / "backslash-dates.zip"
+    with zipfile.ZipFile(zp, "w") as zf:
+        buf = io.BytesIO()
+        ds.save_as(buf, enforce_file_format=True)
+        zf.writestr("backslash.dcm", buf.getvalue())
+
+    ex = tmp_path / "backslash-dates-ex"
+    ex.mkdir(exist_ok=True)
+    members = safe_extract_zip(
+        str(zp), str(ex),
+        settings.max_extracted_bytes, settings.max_extracted_files,
+    )
+    result = Anonymizer(
+        secret=SECRET, shift_dates=True,
+        date_shift_min=-5, date_shift_max=-5,
+    ).run(str(ex), members, str(tmp_path / "backslash-dates-out"))
+    report = result.files[0]
+    out = pydicom.dcmread(os.path.join(result.output_dir, report.output_name))
+    assert list(out.StudyDate) == ["20231227", "20240224", "20241226"]
+    change = next(c for c in report.changes if c.keyword == "StudyDate")
+    assert change.new == "20231227\\20240224\\20241226"
+
+
+def test_any_invalid_multivalue_date_clears_whole_tag(tmp_path):
+    from pydicom.dataelem import DataElement
+    from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+    from pydicom.multival import MultiValue
+    from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian
+    from pydicom.tag import Tag
+
+    fm = FileMetaDataset()
+    fm.MediaStorageSOPClassUID = CTImageStorage
+    fm.MediaStorageSOPInstanceUID = "9.8.7"
+    fm.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = FileDataset(None, {}, file_meta=fm, preamble=b"\0" * 128)
+    ds.SOPClassUID = CTImageStorage
+    ds.SOPInstanceUID = "9.8.7"
+    ds.StudyInstanceUID = "9.8.8"
+    ds.SeriesInstanceUID = "9.8.9"
+    ds.PatientID = "P-BAD-DATE"
+    ds.PatientName = "Bad^Date"
+    ds[Tag(0x00080020)] = DataElement(
+        Tag(0x00080020), "DA",
+        MultiValue(str, ["20240101", "20240230", "20241231"]),
+    )
+    nested = Dataset()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        nested.AcquisitionDateTime = "20240101120000\\20241301120000"
+    ds.ReferencedStudySequence = [nested]
+
+    zp = tmp_path / "bad-dates.zip"
+    with zipfile.ZipFile(zp, "w") as zf:
+        buf = io.BytesIO()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            ds.save_as(buf, enforce_file_format=True)
+        zf.writestr("bad.dcm", buf.getvalue())
+
+    ex = tmp_path / "bad-dates-ex"
+    ex.mkdir(exist_ok=True)
+    members = safe_extract_zip(
+        str(zp), str(ex),
+        settings.max_extracted_bytes, settings.max_extracted_files,
+    )
+    result = Anonymizer(secret=SECRET, shift_dates=True).run(
+        str(ex), members, str(tmp_path / "bad-dates-out")
+    )
+    report = result.files[0]
+    out = pydicom.dcmread(os.path.join(result.output_dir, report.output_name))
+    assert out.StudyDate == ""
+    assert out.ReferencedStudySequence[0].AcquisitionDateTime == ""
+    invalid = [d for d in report.diagnostics if d.code == "INVALID_DATE"]
+    assert len(invalid) == 2
+    actions = {
+        c.keyword: c.action
+        for c in report.changes
+        if c.keyword in ("StudyDate", "AcquisitionDateTime")
+    }
+    assert actions == {"StudyDate": "EMPTY", "AcquisitionDateTime": "EMPTY"}
 
 
 def test_shift_dates_disabled_keeps_dates(tmp_path):

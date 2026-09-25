@@ -24,6 +24,7 @@ from typing import Optional
 import pydicom
 from pydicom.dataset import Dataset, FileMetaDataset
 from pydicom.errors import InvalidDicomError
+from pydicom.multival import MultiValue
 from pydicom.sequence import Sequence
 from pydicom.tag import Tag
 from pydicom.uid import ExplicitVRLittleEndian
@@ -165,6 +166,48 @@ def _shift_dt_text(value: str, delta: timedelta) -> Optional[str]:
     except ValueError:
         return None
     return (d + delta).strftime("%Y%m%d") + tail
+
+
+def _date_value_items(value: object) -> tuple[list[str], bool]:
+    """拆分 DA/DT 的 pydicom 多值或反斜杠分隔字符串。"""
+    if isinstance(value, (MultiValue, list, tuple)):
+        return [str(item) for item in value], True
+    if isinstance(value, str) and "\\" in value:
+        return value.split("\\"), True
+    return [str(value)], False
+
+
+def _shift_date_element(
+    elem,
+    delta: timedelta,
+) -> tuple[Optional[object], str, Optional[str], bool]:
+    """逐项平移 DA/DT；任一分量非法时返回应清空整标签。
+
+    返回 (new_value, old_text, new_text, invalid)。空分量保持为空，确保
+    VM、项数和顺序不变。
+    """
+    raw_items, is_multi = _date_value_items(elem.value)
+    old_text = "\\".join(raw_items)
+    shifted_items: list[str] = []
+    invalid = False
+    for raw in raw_items:
+        if raw == "":
+            shifted_items.append("")
+            continue
+        shifted = (
+            _shift_dt_text(raw, delta)
+            if elem.VR == "DT"
+            else _shift_date_text(raw, delta)
+        )
+        if shifted is None:
+            invalid = True
+        shifted_items.append(shifted or "")
+    if invalid:
+        return "", old_text, None, True
+    new_text = "\\".join(shifted_items)
+    if is_multi:
+        return shifted_items, old_text, new_text, False
+    return shifted_items[0], old_text, new_text, False
 
 
 def _file_sha16(path: str) -> str:
@@ -516,22 +559,11 @@ class Anonymizer:
                 elem.value = patient.new_patient_name
                 continue
 
-            # 6) 出生日期：平移或清空（其余 DA/DT 仅在开启日期平移时处理）
-            if tag_ == tags.PATIENT_BIRTH_DATE:
-                if self.shift_dates and elem.value:
-                    shifted = _shift_date_text(str(elem.value), delta)
-                    new_val = shifted if shifted is not None else ""
-                    if shifted is None:
-                        report.diagnostics.append(
-                            Diagnostic("INVALID_DATE", "warning",
-                                       f"{loc} 日期无法解析，已清空：{_preview(elem.value)}"))
-                    self._record(report, Change(str(tag_), keyword, "REPLACE",
-                                                _preview(elem.value), new_val, path or "/"))
-                    elem.value = new_val
-                else:
-                    self._record(report, Change(str(tag_), keyword, "EMPTY",
-                                                _preview(elem.value), None, path or "/"))
-                    elem.value = ""
+            # 6) 出生日期：关闭平移时清空；开启时与其余 DA/DT 统一逐项平移
+            if tag_ == tags.PATIENT_BIRTH_DATE and not self.shift_dates:
+                self._record(report, Change(str(tag_), keyword, "EMPTY",
+                                            _preview(elem.value), None, path or "/"))
+                elem.value = ""
                 continue
 
             # 7) 其余 PN：全部清空（如 ReferencedPatientSequence 以外的人名）
@@ -541,25 +573,24 @@ class Anonymizer:
                 elem.value = ""
                 continue
 
-            # 8) 日期平移（DA/DT），保留时间部分；非法日期告警并清空
+            # 8) 日期平移（DA/DT），逐项处理多值并保留时间/时区尾部；任一非法即清空
             if self.shift_dates and elem.VR in ("DA", "DT") and elem.value not in (None, ""):
-                raw = str(elem.value)
-                shifted = (
-                    _shift_dt_text(raw, delta)
-                    if elem.VR == "DT"
-                    else _shift_date_text(raw, delta)
+                new_value, old_text, new_text, invalid_date = _shift_date_element(
+                    elem, delta
                 )
-                if shifted is None:
+                old_preview = _preview(old_text)
+                if invalid_date:
                     report.diagnostics.append(
                         Diagnostic("INVALID_DATE", "warning",
-                                   f"{loc} 日期无法解析，已清空：{_preview(elem.value)}"))
+                                   f"{loc} 日期无法解析，已清空：{old_preview}"))
                     self._record(report, Change(str(tag_), keyword, "EMPTY",
-                                                _preview(elem.value), None, path or "/"))
-                    elem.value = ""
-                elif shifted != raw:
+                                                old_preview, None, path or "/"))
+                    elem.value = new_value
+                elif new_text != old_text:
                     self._record(report, Change(str(tag_), keyword, "REPLACE",
-                                                _preview(elem.value), shifted, path or "/"))
-                    elem.value = shifted
+                                                old_preview, _preview(new_text),
+                                                path or "/"))
+                    elem.value = new_value
                 continue
 
             # 9) 明确要求删除 / 清空的标签
