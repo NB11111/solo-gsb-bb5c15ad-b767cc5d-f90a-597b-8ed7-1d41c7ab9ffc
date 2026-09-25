@@ -727,3 +727,211 @@ def test_mixed_empty_and_normal_uids_keep_normal_mapping(tmp_path):
     assert (out_a.ReferencedSOPSequence[0].ReferencedSOPInstanceUID
             == b.sop_instance_uid)
     assert a.output_name == f"{a.sop_instance_uid}.dcm"
+
+
+# --------------------------------------------------------------------------- #
+# 多值 DA/DT（pydicom MultiValue 与反斜杠分隔字符串）逐项平移
+# --------------------------------------------------------------------------- #
+TAG_CALIB_DATE = str(pydicom.tag.Tag(0x00181200))        # (0018, 1200)
+TAG_CALIB_DATETIME = str(pydicom.tag.Tag(0x00181201))    # (0018, 1201)
+TAG_ANATOMIC_REGION_SQ = 0x00082218
+
+
+def _calibration_dataset(sop: str, *, da=None, dt=None, nested=False) -> bytes:
+    """构造带多值 DA/DT 的最小 CT；nested=True 时再在 AnatomicRegionSequence
+    内放一对多值 DA/DT，覆盖嵌套序列的同一规则。
+
+    (0018,1200)/(0018,1201) 是校准日期/日期时间标签（DA/DT 多值 VR），引擎按
+    VR 分发、不依赖关键字，因此断言统一用标签比较。
+    """
+    from pydicom.dataelem import DataElement
+    from pydicom.dataset import Dataset, FileDataset, FileMetaDataset
+    from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian
+
+    fm = FileMetaDataset()
+    fm.MediaStorageSOPClassUID = CTImageStorage
+    fm.MediaStorageSOPInstanceUID = sop
+    fm.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = FileDataset(None, {}, file_meta=fm, preamble=b"\0" * 128)
+    ds.SOPClassUID = CTImageStorage
+    ds.SOPInstanceUID = sop
+    ds.StudyInstanceUID = f"{sop}.2"
+    ds.SeriesInstanceUID = f"{sop}.3"
+    ds.PatientID = "P-MV"
+    ds.PatientName = "Doe^Multi"
+    ds.StudyDate = "20240301"
+    if da is not None:
+        ds[0x00181200] = DataElement(0x00181200, "DA", da)
+    if dt is not None:
+        ds[0x00181201] = DataElement(0x00181201, "DT", dt)
+    if nested:
+        item = Dataset()
+        item[0x00181200] = DataElement(0x00181200, "DA", ["20240101", "20240630"])
+        item[0x00181201] = DataElement(
+            0x00181201, "DT",
+            ["20240101120000", "20240630235959.123456-0500"],
+        )
+        ds[TAG_ANATOMIC_REGION_SQ] = DataElement(
+            TAG_ANATOMIC_REGION_SQ, "SQ", [item]
+        )
+    buf = io.BytesIO()
+    ds.save_as(buf, enforce_file_format=True)
+    return buf.getvalue()
+
+
+def _run_calibration(tmp_path, files: dict, *, shift_dates: bool = True,
+                     shift: int = -5):
+    zp = tmp_path / "mv.zip"
+    with zipfile.ZipFile(zp, "w") as zf:
+        for name, blob in files.items():
+            zf.writestr(name, blob)
+    ex = tmp_path / "mv-ex"
+    ex.mkdir()
+    entries = safe_extract_zip(str(zp), str(ex),
+                               settings.max_extracted_bytes,
+                               settings.max_extracted_files)
+    engine = Anonymizer(
+        secret=SECRET, shift_dates=shift_dates,
+        date_shift_min=shift, date_shift_max=shift,
+    )
+    result = engine.run(str(ex), entries, str(tmp_path / "mv-out"))
+    return result
+
+
+def test_multivalue_da_dt_shifted_item_by_item(tmp_path):
+    """pydicom 多值 DA/DT：逐项按同一患者偏移平移，项数/顺序不变。"""
+    result = _run_calibration(tmp_path, {
+        "a.dcm": _calibration_dataset(
+            "9.7.1.1",
+            da=["20240301", "20240315"],
+            dt=["20240301101500+0100", "20240315083000.5"],
+        ),
+    })
+    rep = result.files[0]
+    assert rep.status == "ok"
+    out = pydicom.dcmread(os.path.join(result.output_dir, rep.output_name))
+    da = out[0x00181200]
+    assert list(da.value) == ["20240225", "20240310"]  # 两项都平移 5 天
+    assert da.VM == 2
+    dt = out[0x00181201]
+    # DT 只改日期前缀，时间与时区/小数秒尾部原样保留
+    assert list(dt.value) == ["20240225101500+0100", "20240310083000.5"]
+    assert dt.VM == 2
+
+    # 变更预览与写出内容一致（旧值/新值均以反斜杠拼接，而非 Python 列表展示）
+    by_tag = {c.tag: c for c in rep.changes}
+    assert by_tag[TAG_CALIB_DATE].old == "20240301\\20240315"
+    assert by_tag[TAG_CALIB_DATE].new == "20240225\\20240310"
+    assert by_tag[TAG_CALIB_DATETIME].new == (
+        "20240225101500+0100\\20240310083000.5")
+    for tag_ in (0x00181200, 0x00181201):
+        ch = by_tag[str(pydicom.tag.Tag(tag_))]
+        assert ch.new == "\\".join(str(v) for v in out[tag_].value)
+
+
+def test_backslash_separated_da_dt_shifted_item_by_item(tmp_path):
+    """VM=1 标签写入反斜杠分隔值时同样逐项处理，写出仍为同项数多值。"""
+    result = _run_calibration(tmp_path, {
+        "a.dcm": _calibration_dataset(
+            "9.7.2.1",
+            da="20240301\\20240315",
+            dt="20240301101500\\20240315083000",
+        ),
+    })
+    rep = result.files[0]
+    assert rep.status == "ok"
+    out = pydicom.dcmread(os.path.join(result.output_dir, rep.output_name))
+    assert list(out[0x00181200].value) == ["20240225", "20240310"]
+    assert list(out[0x00181201].value) == ["20240225101500", "20240310083000"]
+    by_tag = {c.tag: c for c in rep.changes}
+    assert by_tag[TAG_CALIB_DATE].new == "20240225\\20240310"
+
+
+def test_multivalue_any_invalid_item_clears_whole_tag(tmp_path):
+    """任一项日期非法：清空整项标签并记 INVALID_DATE，不残留首个/合法项。"""
+    result = _run_calibration(tmp_path, {
+        "bad_da.dcm": _calibration_dataset(
+            "9.7.3.1", da=["20240301", "bogus"]),
+        "bad_dt.dcm": _calibration_dataset(
+            "9.7.3.2", dt=["20240301101500", "20240230"]),  # 2 月 30 日
+    })
+    by_name = {r.name: r for r in result.files}
+
+    bad_da = by_name["bad_da.dcm"]
+    assert bad_da.status == "warning"
+    msg = next(d.message for d in bad_da.diagnostics
+               if d.code == "INVALID_DATE")
+    assert "第 2 项" in msg
+    ch = next(c for c in bad_da.changes if c.tag == TAG_CALIB_DATE)
+    assert ch.action == "EMPTY" and ch.new is None
+    out_da = pydicom.dcmread(
+        os.path.join(result.output_dir, bad_da.output_name))
+    assert out_da[0x00181200].value == ""  # 合法首项也不得残留
+
+    bad_dt = by_name["bad_dt.dcm"]
+    assert any(d.code == "INVALID_DATE" for d in bad_dt.diagnostics)
+    out_dt = pydicom.dcmread(
+        os.path.join(result.output_dir, bad_dt.output_name))
+    assert out_dt[0x00181201].value == ""
+
+
+def test_nested_sequence_multivalue_da_dt_uses_same_rules(tmp_path):
+    """嵌套序列中的多值 DA/DT 逐项平移，预览路径指向嵌套项。"""
+    result = _run_calibration(tmp_path, {
+        "a.dcm": _calibration_dataset("9.7.4.1", nested=True),
+    })
+    rep = result.files[0]
+    assert rep.status == "ok"
+    out = pydicom.dcmread(os.path.join(result.output_dir, rep.output_name))
+    item = out[TAG_ANATOMIC_REGION_SQ][0]
+    assert list(item[0x00181200].value) == ["20231227", "20240625"]
+    assert list(item[0x00181201].value) == [
+        "20231227120000", "20240625235959.123456-0500"]
+    nested_changes = [
+        c for c in rep.changes
+        if c.tag in (TAG_CALIB_DATE, TAG_CALIB_DATETIME)
+        and c.path not in ("", "/")
+    ]
+    assert len(nested_changes) == 2
+    assert all("AnatomicRegionSequence[0]" in c.path for c in nested_changes)
+    for c in nested_changes:
+        g, e = c.tag.strip("()").split(",")
+        nested_tag = pydicom.tag.Tag(int(g, 16), int(e, 16))
+        assert c.new == "\\".join(
+            str(v) for v in item[nested_tag].value)
+
+
+def test_multivalue_dates_untouched_when_shift_disabled(tmp_path):
+    """关闭日期平移：多值 DA/DT 维持原值，且不产生任何变更条目。"""
+    result = _run_calibration(
+        tmp_path,
+        {"a.dcm": _calibration_dataset(
+            "9.7.6.1",
+            da=["20240301", "20240315"],
+            dt=["20240301101500+0100", "20240315083000.5"],
+        )},
+        shift_dates=False,
+    )
+    rep = result.files[0]
+    assert rep.status == "ok"
+    out = pydicom.dcmread(os.path.join(result.output_dir, rep.output_name))
+    assert list(out[0x00181200].value) == ["20240301", "20240315"]
+    assert list(out[0x00181201].value) == [
+        "20240301101500+0100", "20240315083000.5"]
+    assert not [
+        c for c in rep.changes
+        if c.tag in (TAG_CALIB_DATE, TAG_CALIB_DATETIME)]
+
+
+def test_multivalue_zero_delta_records_no_change(tmp_path):
+    """派生偏移恰为 0 天时多值标签保持原样（不记录无意义变更）。"""
+    result = _run_calibration(
+        tmp_path,
+        {"a.dcm": _calibration_dataset(
+            "9.7.7.1", da=["20240301", "20240315"])},
+        shift=0,
+    )
+    rep = result.files[0]
+    out = pydicom.dcmread(os.path.join(result.output_dir, rep.output_name))
+    assert list(out[0x00181200].value) == ["20240301", "20240315"]
+    assert not [c for c in rep.changes if c.tag == TAG_CALIB_DATE]

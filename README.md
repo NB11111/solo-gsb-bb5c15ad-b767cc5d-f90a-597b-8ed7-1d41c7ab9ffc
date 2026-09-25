@@ -18,7 +18,10 @@
    RT 引用关系不变**；
 4. （可选，默认开启）对每位患者在**可配置闭区间**（`date_shift_min`..`date_shift_max`，
    默认 -365..365 天）内派生一个稳定的日期偏移，平移全部 `DA`/`DT` 标签，
-   患者出生与检查日期使用同一偏移；同一患者跨批次且范围相同时偏移一致；
+   患者出生与检查日期使用同一偏移；同一患者跨批次且范围相同时偏移一致。
+   `DA`/`DT` 的**多值**（pydicom 多值及反斜杠分隔值）按同一项数与顺序**逐项**
+   平移，`DT` 仅替换日期前缀、保留时间/时区尾部；任一项日期非法时按
+   `INVALID_DATE` 规则清空整个标签（不残留合法项）；
 5. 返回**标签变更预览**（逐标签 old → new）与**逐文件诊断**（非法 DICOM、
    引用缺失、UID 缺失等），并提供**匿名化 ZIP 下载**（扁平文件名，不保留原始
    目录结构，避免路径泄露 PHI）。
@@ -1403,7 +1406,7 @@ else:
 | `WRITE_ERROR` | error | 匿名化写出阶段异常 |
 | `DANGLING_REFERENCE` | warning | 序列引用的 SOP 实例不在 ZIP 内（引用仍一致重写） |
 | `MISSING_STUDY_UID` / `MISSING_SERIES_UID` / `MISSING_SOP_UID` | warning | 顶层 UID **标签缺失或标签存在但值为空（含仅空白）**，已生成确定性替代 UID |
-| `INVALID_DATE` | warning | DA/DT 值无法解析，已清空 |
+| `INVALID_DATE` | warning | DA/DT 值无法解析（多值时任一项非法），已清空整个标签 |
 | `PATIENT_IDENTITY_FALLBACK` | warning | 缺少 PatientID/Name，按 Study UID 或文件内容归组 |
 | `DUPLICATE_SOP_INSTANCE` | warning | 多个文件共享同一 SOP UID，输出文件自动改名 |
 | `DICOMDIR_SKIPPED` | info | DICOMDIR 不写入匿名包（其路径会泄露 PHI） |
@@ -1428,6 +1431,9 @@ else:
   `IssuerOfPatientIDQualifiersSequence`、`OtherPatientIDs(Sequence)` 等关联身份
   字段一并删除。
 - `PatientBirthDate`：开启日期平移时按该患者偏移平移，否则清空。
+- 其余全部 `DA`/`DT`（含嵌套序列、多值及反斜杠分隔值）：开启平移时逐项按
+  该患者偏移平移（保留项数、顺序与 `DT` 的时间/时区尾部）；任一项非法即清空
+  整个标签并记 `INVALID_DATE`；关闭平移时保持原值不动。
 - 其余所有人名（VR=`PN`）一律置空。
 - Annex E 列举的机构、站点、设备序列号、申请单号、自由文本/备注等标签：
   置空或删除（完整列表见 `app/tags.py`）。

@@ -167,6 +167,53 @@ def _shift_dt_text(value: str, delta: timedelta) -> Optional[str]:
     return (d + delta).strftime("%Y%m%d") + tail
 
 
+def _date_parts(value: object) -> tuple[list[str], bool]:
+    """展开 DA/DT 元素为有序的逐项字符串列表。
+
+    pydicom 对 VM>1 文本 VR 返回 MultiValue（注意：pydicom 3 的 MultiValue
+    并不继承 list/tuple，必须显式按 MultiValue 判断）；VM=1 标签若写入了
+    反斜杠分隔值，元素值也可能是带 ``\\`` 的单一字符串。两种形态都按 DICOM
+    值分隔符 ``\\`` 拆成分量，保留原有项数与顺序。
+
+    返回 ``(parts, is_multivalue)``：``is_multivalue`` 表示原值来自多值/反斜杠
+    形态（预览与比较需要用 ``\\`` 拼接还原，不能直接 str(list)）。
+    """
+    if isinstance(value, (pydicom.multival.MultiValue, list, tuple)):
+        return [str(part) for part in value], True
+    text = str(value)
+    if "\\" in text:
+        return text.split("\\"), True
+    return [text], False
+
+
+def _shift_date_element(
+    value: object, vr: str, delta: timedelta
+) -> tuple[Optional[str], Optional[int]]:
+    """逐项平移 DA/DT 元素，返回 (新值, 首个非法分量的 0 基序号)。
+
+    * 多值（pydicom MultiValue / 反斜杠分隔字符串）逐项应用同一偏移，
+      保留项数、顺序；DT 仅替换前 8 位日期，时间/时区尾部原样保留；
+    * 任一分量日期非法（含空分量）时返回 ``(None, 序号)``，调用方按既有
+      INVALID_DATE 规则清空整个标签，确保不残留任何原始日期；
+    * 全部合法时新值为 ``\\`` 拼接字符串（pydicom 对 DA/DT 写回时会重新
+      解析成与输入同项数的 MultiValue）。
+    """
+    parts, _ = _date_parts(value)
+    if not parts:
+        return "", None
+    shifted_parts: list[str] = []
+    for idx, part in enumerate(parts):
+        part = part.strip()
+        shifted = (
+            _shift_dt_text(part, delta) if vr == "DT"
+            else _shift_date_text(part, delta)
+        )
+        if shifted is None:
+            return None, idx
+        shifted_parts.append(shifted)
+    return "\\".join(shifted_parts), None
+
+
 def _file_sha16(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -375,6 +422,53 @@ class Anonymizer:
         report.changes.append(change)
         self.total_change_count += 1
 
+    # ----- DA/DT（含多值）-------------------------------------------------- #
+    def _rewrite_date_element(
+        self,
+        elem,
+        path: str,
+        loc: str,
+        report: FileReport,
+        delta: timedelta,
+        *,
+        invalid_action: str,
+    ) -> None:
+        """开启平移时逐项重写 DA/DT（pydicom 多值与反斜杠分隔值同样处理）。
+
+        保留原项数、顺序与 DT 的时间/时区尾部；任一项日期非法时，按既有
+        INVALID_DATE 规则清空**整项标签**并记录诊断，避免原始日期残留。
+        预览的 old/new 用 ``\\`` 拼接，与写出的匿名 DICOM 实际取值一致。
+        """
+        raw_value = elem.value
+        parts, is_multi = _date_parts(raw_value)
+        old_joined = "\\".join(part.strip() for part in parts)
+        # 多值元素的 elem.value 是 MultiValue，str() 会变成 Python 列表展示；
+        # 预览改用反斜杠拼接，与写出的匿名 DICOM 实际字节一致
+        old_preview = _preview(old_joined if is_multi else raw_value)
+        new_value, bad_idx = _shift_date_element(raw_value, elem.VR, delta)
+        if bad_idx is not None:
+            report.diagnostics.append(
+                Diagnostic(
+                    "INVALID_DATE", "warning",
+                    f"{loc} 第 {bad_idx + 1} 项日期无法解析，已清空整个标签：{old_preview}",
+                )
+            )
+            self._record(
+                report,
+                Change(str(elem.tag), elem.keyword or "", invalid_action,
+                       old_preview, "" if invalid_action == "REPLACE" else None,
+                       path or "/"),
+            )
+            elem.value = ""
+            return
+        if new_value != old_joined:
+            self._record(
+                report,
+                Change(str(elem.tag), elem.keyword or "", "REPLACE",
+                       old_preview, new_value, path or "/"),
+            )
+            elem.value = new_value
+
     # ----- 单文件匿名化 ----------------------------------------------------- #
     def _ensure_top_level_uids(self, ds: Dataset, report: FileReport) -> None:
         """补齐顶层必需 UID，缺失（含标签存在但值为空/空白）时生成确定性 UID。
@@ -466,8 +560,12 @@ class Anonymizer:
                 if value is None:
                     continue
                 # 兼容 VM>1 的 UI（极少数标签），逐分量映射
-                if isinstance(value, (list, tuple)) or "\\" in str(value):
-                    parts = list(value) if isinstance(value, (list, tuple)) else str(value).split("\\")
+                if isinstance(value, (pydicom.multival.MultiValue, list, tuple)) or "\\" in str(value):
+                    parts = (
+                        list(value)
+                        if isinstance(value, (pydicom.multival.MultiValue, list, tuple))
+                        else str(value).split("\\")
+                    )
                     new_parts = []
                     changed = False
                     for part in parts:
@@ -519,15 +617,11 @@ class Anonymizer:
             # 6) 出生日期：平移或清空（其余 DA/DT 仅在开启日期平移时处理）
             if tag_ == tags.PATIENT_BIRTH_DATE:
                 if self.shift_dates and elem.value:
-                    shifted = _shift_date_text(str(elem.value), delta)
-                    new_val = shifted if shifted is not None else ""
-                    if shifted is None:
-                        report.diagnostics.append(
-                            Diagnostic("INVALID_DATE", "warning",
-                                       f"{loc} 日期无法解析，已清空：{_preview(elem.value)}"))
-                    self._record(report, Change(str(tag_), keyword, "REPLACE",
-                                                _preview(elem.value), new_val, path or "/"))
-                    elem.value = new_val
+                    # 出生日期 VM=1，但同样经逐项处理入口，多值/反斜杠形态下
+                    # 任一分量非法也会清空整标签（与其余 DA/DT 同口径）
+                    self._rewrite_date_element(
+                        elem, path, loc, report, delta, invalid_action="REPLACE"
+                    )
                 else:
                     self._record(report, Change(str(tag_), keyword, "EMPTY",
                                                 _preview(elem.value), None, path or "/"))
@@ -541,25 +635,11 @@ class Anonymizer:
                 elem.value = ""
                 continue
 
-            # 8) 日期平移（DA/DT），保留时间部分；非法日期告警并清空
+            # 8) 日期平移（DA/DT），保留时间部分；多值逐项平移，非法清空
             if self.shift_dates and elem.VR in ("DA", "DT") and elem.value not in (None, ""):
-                raw = str(elem.value)
-                shifted = (
-                    _shift_dt_text(raw, delta)
-                    if elem.VR == "DT"
-                    else _shift_date_text(raw, delta)
+                self._rewrite_date_element(
+                    elem, path, loc, report, delta, invalid_action="EMPTY"
                 )
-                if shifted is None:
-                    report.diagnostics.append(
-                        Diagnostic("INVALID_DATE", "warning",
-                                   f"{loc} 日期无法解析，已清空：{_preview(elem.value)}"))
-                    self._record(report, Change(str(tag_), keyword, "EMPTY",
-                                                _preview(elem.value), None, path or "/"))
-                    elem.value = ""
-                elif shifted != raw:
-                    self._record(report, Change(str(tag_), keyword, "REPLACE",
-                                                _preview(elem.value), shifted, path or "/"))
-                    elem.value = shifted
                 continue
 
             # 9) 明确要求删除 / 清空的标签
